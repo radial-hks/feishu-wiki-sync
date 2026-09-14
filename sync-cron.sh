@@ -20,6 +20,10 @@ fi
 
 # 2) 有变化才提交（变更审计）
 cd "$WIKI"
+
+# 3) 编译知识图谱（raw 变化后重编译实体/概念/索引）
+"$SYNC_REPO/compile_wiki.py" --out "$WIKI" 2>>"$LOG" | tail -1 >> "$LOG"
+
 if [ -n "$(git status --porcelain)" ]; then
     SUMMARY=$(echo "$OUT" | tail -1)
     git add -A
