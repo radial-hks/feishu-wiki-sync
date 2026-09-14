@@ -979,18 +979,18 @@ class WikiSyncer:
             title = node.get("title") or obj_token or "untitled"
             # 目标路径先算出来，供增量闸门与 prune 共用
             path = self.out / node_dir / (sanitize_name(title) + FILE_SUFFIX)
-            seen_paths.add(str(path.relative_to(self.out)))
+            rel_path = str(path.relative_to(self.out))
             try:
+                # ---- 表格跳过（skip_tables 时: 不进 seen_paths → prune 清理旧文件）----
+                if obj_type in ("sheets", "base") and self.skip_tables:
+                    LOG.debug("跳过表格节点 %s (%s)", title, obj_type)
+                    self.stats.skipped += 1
+                    continue
+                seen_paths.add(rel_path)
                 # ---- 增量闸门（云端版本为准，提前到内容拉取之前）----
                 entry = self.state["nodes"].get(node_content_key(node))
                 if obj_type == "docx" and not needs_sync(
                         entry, node_version(node), path):
-                    self.stats.skipped += 1
-                    continue
-                # 表格类不在闸门内（skip_tables 时直接跳过）
-                if obj_type in ("sheets", "base") and self.skip_tables:
-                    # 表格类: 跳过(对知识图谱价值低), 记录链接便于溯源
-                    LOG.debug("跳过表格节点 %s (%s)", title, obj_type)
                     self.stats.skipped += 1
                     continue
                 if obj_type in ("docx", "doc", "sheets", "base") or \
