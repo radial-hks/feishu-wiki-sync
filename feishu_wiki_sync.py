@@ -34,6 +34,7 @@ import sys
 import time
 import urllib.parse
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
@@ -84,6 +85,104 @@ IMAGE_MAGIC = (
 
 # 图片占位引用格式: ![alt](feishu://image/<token>)
 FEISHU_IMAGE_RE = re.compile(r"!\[([^\]]*)\]\(feishu://image/([^)]+)\)")
+
+# ---------------------------------------------------------------------------
+# 文档内嵌属性块检测（正文开头/结尾的 ```text YAML 代码块）
+# ---------------------------------------------------------------------------
+
+INLINE_PROPS_FENCE_RE = re.compile(
+    r"```(?:text|yaml|yml)\s*\n(---\n.*?\n---)\s*\n```", re.DOTALL)
+
+# frontmatter 中由同步器管理、内嵌属性不得覆盖的保留键
+RESERVED_FRONTMATTER_KEYS = frozenset({
+    "title", "source", "revision", "imported_at", "synced_at", "sha"})
+
+
+def extract_inline_props(body: str) -> tuple:
+    """从正文中提取内嵌属性代码块。
+
+    返回 (props_dict, cleaned_body)。只识别包含 YAML frontmatter
+    (--- ... ---) 的 ```text/yaml 代码块；没有则返回 ({}, body) 原样。
+    """
+    match = INLINE_PROPS_FENCE_RE.search(body)
+    if not match:
+        return {}, body
+    raw = match.group(1)
+    props = _parse_simple_yaml(raw)
+    if not props:
+        return {}, body
+    # 移除代码块（含其后紧邻的空行），保留其余正文
+    cleaned = body[:match.start()] + body[match.end():]
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+    return props, cleaned
+
+
+def _parse_simple_yaml(raw: str) -> dict:
+    """解析扁平 YAML（key: value / key: [a, b]），够用即可，不引依赖。
+
+    多行值（summary: "...") 按带引号字符串或折叠到单行处理。
+    """
+    lines = raw.strip().strip("-").strip().splitlines()
+    props: dict = {}
+    i = 0
+    while i < len(lines):
+        line = lines[i].strip()
+        i += 1
+        if not line or line.startswith("#") or ":" not in line:
+            continue
+        key, _, value = line.partition(":")
+        key = key.strip()
+        value = value.strip()
+        if not value:
+            # 可能是多行值（下一行缩进引号串）——尽力拼接
+            while i < len(lines) and lines[i].strip() and ":" not in lines[i]:
+                value += (" " if value else "") + lines[i].strip()
+                i += 1
+            if not value:
+                props[key] = ""
+                continue
+        if value.startswith("[") and value.endswith("]"):
+            inner = value[1:-1].strip()
+            props[key] = [v.strip().strip("'\"") for v in inner.split(",") if v.strip()]
+        else:
+            props[key] = value.strip("'\"")
+    return props
+
+
+def yaml_value(v) -> str:
+    """把值渲染回 YAML 安全的标量。"""
+    if isinstance(v, list):
+        return "[" + ", ".join(yaml_value(x) for x in v) + "]"
+    s = str(v)
+    if any(c in s for c in ":#{}[]\"'&*!|>%@`,\n") or s != s.strip() or not s:
+        return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
+    return s
+
+
+def build_frontmatter(title: str, source_url: str, revision: Any,
+                      imported_at: str, inline_props: Optional[dict],
+                      extra: Optional[dict] = None) -> str:
+    """组装统一规范的 frontmatter。
+
+    结构分三段：
+      1. 同步器管理字段（title/source/revision/imported_at）
+      2. 内嵌属性块合并进来的业务字段（type/department/tags/owner/...，
+         仅补缺，不覆盖保留键）
+      3. extra 附加字段（如 synced_at）
+    """
+    lines = ["---",
+             f"title: {yaml_value(title)}",
+             f"source: {yaml_value(source_url)}",
+             f"revision: {yaml_value(str(revision) if revision is not None else '')}",
+             f"imported_at: {yaml_value(imported_at)}"]
+    for key, value in (inline_props or {}).items():
+        if key.lower() in RESERVED_FRONTMATTER_KEYS or key in lines[1:4]:
+            continue
+        lines.append(f"{key}: {yaml_value(value)}")
+    for key, value in (extra or {}).items():
+        lines.append(f"{key}: {yaml_value(value)}")
+    lines.append("---")
+    return "\n".join(lines)
 
 
 def sanitize_name(name: str, fallback: str = "untitled") -> str:
@@ -788,8 +887,9 @@ class WikiSyncer:
                 stack.append((child, node_dir))
 
     # -- materialize -------------------------------------------------------
-    def sync_from(self, root_token: str):
+    def sync_from(self, root_token: str = "", prune: bool = False):
         self.out.mkdir(parents=True, exist_ok=True)
+        seen_paths: set = set()
         for node, node_dir, child_count in self.walk_from(root_token):
             self.stats.total += 1
             obj_type = WIKI_TYPE_MAP.get(str(node.get("obj_type") or ""),
@@ -807,9 +907,24 @@ class WikiSyncer:
                     self.stats.skipped += 1
                     continue
                 md, images = self._resolve_images(content, node_dir)
+                # 内嵌属性块: 从正文中提取并合并到 frontmatter
+                inline_props, cleaned_body = extract_inline_props(md)
+                source_url = (f"https://feishu.cn/wiki/"
+                               f"{node.get('node_token', '')}")
+                revision = (meta or {}).get("revision_id",
+                                            node.get("obj_edit_time", ""))
+                front = build_frontmatter(
+                    title=title, source_url=source_url,
+                    revision=revision,
+                    imported_at=datetime.now().strftime("%Y-%m-%d"),
+                    inline_props=inline_props,
+                    extra={"synced_at":
+                           datetime.now().strftime("%Y-%m-%dT%H:%M:%S")})
+                full_md = f"{front}\n\n{cleaned_body}\n" if cleaned_body else front + "\n"
                 path = self.out / node_dir / (sanitize_name(title) + FILE_SUFFIX)
                 path.parent.mkdir(parents=True, exist_ok=True)
-                if self._write_if_changed(path, md, node, meta):
+                seen_paths.add(str(path.relative_to(self.out)))
+                if self._write_if_changed(path, full_md, node, meta):
                     self.stats.written += 1
                 else:
                     self.stats.skipped += 1
@@ -827,33 +942,71 @@ class WikiSyncer:
                 LOG.exception("节点 %s 异常", title)
                 self.stats.failed += 1
                 self.stats.errors.append(f"{title}: {exc}")
+        self._prune(seen_paths if prune else None)
         self._save_state()
         return self.stats
 
+    def _prune(self, seen_paths: Optional[set]) -> int:
+        """删除本地多余文件（源端已删除/改名），并清理空目录与失效状态。
+
+        seen_paths 为 None 时跳过清理（保守模式）。
+        返回删除的文件数。
+        """
+        if seen_paths is None:
+            return 0
+        removed = 0
+        # 1) 本地存在但本轮未同步到的 .md → 源端已删除/改名
+        for fpath in self.out.rglob("*.md"):
+            rel = str(fpath.relative_to(self.out))
+            if rel not in seen_paths:
+                LOG.info("清理(源端已删除): %s", rel)
+                fpath.unlink()
+                removed += 1
+        # 2) 状态文件中已不存在于 seen 的条目
+        valid_tokens = set()
+        for entry in self.state.get("nodes", {}).values():
+            if entry.get("path") in seen_paths:
+                valid_tokens.add(entry.get("edit_time", ""))  # 占位，下面按 token 清
+        # 直接按 path 判定重建 state
+        new_nodes = {}
+        for token, entry in self.state.get("nodes", {}).items():
+            if entry.get("path") in seen_paths:
+                new_nodes[token] = entry
+        self.state["nodes"] = new_nodes
+        # 3) 清理空目录（自底向上）
+        for d in sorted(self.out.rglob("*"), reverse=True):
+            if d.is_dir() and d != self.out:
+                try:
+                    next(d.iterdir())
+                except StopIteration:
+                    d.rmdir()
+        return removed
+
     def _render_node(self, obj_type: str, obj_token: str, title: str):
-        """按文档类型渲染，返回 (markdown, meta)。"""
-        front = f"---\nfeishu_title: {json.dumps(title, ensure_ascii=False)}\n"
+        """按文档类型渲染正文，返回 (body_markdown, meta)。
+
+        frontmatter 由 sync_from 统一组装，这里只产正文。
+        """
         if obj_type == "docx":
             meta = self.client.get_doc_meta(obj_token)
             blocks = self.client.get_all_blocks(obj_token)
             renderer = BlockRenderer(self.client, obj_token,
                                      self.max_sheet_rows)
             body = renderer.render(blocks)
-            return (f"{front}feishu_doc: docx/{obj_token}\n---\n\n{body}"), meta
+            return body, meta
         if obj_type == "sheets":
             body, stitle = render_sheet(self.client, obj_token,
                                         self.max_sheet_rows)
-            return (f"{front}feishu_doc: sheets/{obj_token}\n---\n\n{body}"), {}
+            return body, {}
         if obj_type == "base":
             body, btitle = render_bitable(self.client, obj_token,
                                           self.max_bitable_records)
-            return (f"{front}feishu_doc: base/{obj_token}\n---\n\n{body}"), {}
+            return body, {}
         if obj_type == "doc":
             body, _ = render_legacy_doc(self.client, obj_token)
-            return (f"{front}feishu_doc: doc/{obj_token}\n---\n\n{body}"), {}
+            return body, {}
         # 未知类型（wiki 子 wiki / 文件等）
-        return (f"{front}feishu_doc: {obj_type}/{obj_token}\n---\n\n"
-                f"*不支持的文档类型: {obj_type}*"), {}
+        return f"*不支持的文档类型: {obj_type}*", {}
 
     def _resolve_images(self, markdown: str, node_dir: Path) -> tuple:
         """下载 feishu://image/ 引用并改写为相对路径，返回 (md, 下载计数)。"""
@@ -942,6 +1095,8 @@ def main(argv=None):
     parser.add_argument("--max-depth", type=int, default=20)
     parser.add_argument("--max-nodes", type=int, default=5000)
     parser.add_argument("--no-images", action="store_true")
+    parser.add_argument("--prune", action="store_true",
+                        help="删除源端已不存在的本地文件（定时清理）")
     parser.add_argument("-v", "--verbose", action="store_true")
     parser.add_argument("command", choices=["list-spaces", "sync"],
                         help="list-spaces: 列出空间; sync: 同步")
@@ -978,7 +1133,7 @@ def main(argv=None):
     syncer = WikiSyncer(client, out, space,
                         max_depth=args.max_depth, max_nodes=args.max_nodes,
                         download_images=not args.no_images)
-    stats = syncer.sync_from(root_token)
+    stats = syncer.sync_from(root_token, prune=args.prune)
     print(f"完成: 遍历 {stats.total} 节点, 写入 {stats.written}, "
           f"跳过 {stats.skipped}, 失败 {stats.failed}, 图片 {stats.images}")
     for err in stats.errors[:10]:

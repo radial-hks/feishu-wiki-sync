@@ -33,8 +33,38 @@ python3 feishu_wiki_sync.py sync --app-id X --app-secret Y \
 
 # 4. 定时（cron 示例，每小时）
 FEISHU_APP_ID=X FEISHU_APP_SECRET=Y
-0 * * * * python3 /path/to/feishu_wiki_sync.py sync --space <id> --out ./output >> sync.log 2>&1
+0 * * * * python3 /path/to/feishu_wiki_sync.py sync --space <id> --out ./output --prune >> sync.log 2>&1
 ```
+
+## Frontmatter 规范（统一属性）
+
+每个导出文档自动组装规范化 frontmatter，分三段：
+
+```yaml
+---
+# 1. 同步器管理字段（保留键，内嵌属性不覆盖）
+title: 组织指南
+source: https://feishu.cn/wiki/<node_token>
+revision: 12            # 飞书 revision_id（docx）或 obj_edit_time
+imported_at: 2026-09-14
+# 2. 文档内嵌属性块自动合并（正文开头/结尾的 ```text YAML 代码块会被提取、移出正文）
+type: 指南
+department: 工程与交付
+tags: [组织架构, 部门总览, ...]
+owner: 陈蓓
+reviewer: 郑兴
+status: 草稿
+review: 2026-12-31
+summary: "..."
+# 3. 附加字段
+synced_at: "2026-09-14T16:02:02"
+---
+```
+
+## 定时清理
+
+`--prune`：源端已删除/改名的文档，本地对应 `.md` 一并删除，state 同步清理，
+空目录回收。建议 cron 中每轮都带 `--prune` 保持镜像一致。
 
 ## 输出结构
 

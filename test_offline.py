@@ -30,14 +30,32 @@ NODES = {
         "title": "数据表B", "obj_type": "sheets", "obj_token": "shtcn333",
         "has_child": False, "obj_edit_time": 1700000000000,
     },
+    "wikin_child_doc3": {
+        "node_token": "wikin_child_doc3", "space_id": WIKI_SPACE,
+        "title": "组织指南", "obj_type": "docx", "obj_token": "doxcn444",
+        "has_child": False, "obj_edit_time": 1700000000000,
+    },
 }
-CHILDREN = {"wikin_root_001": [NODES["wikin_child_doc1"], NODES["wikin_child_doc2"]]}
+CHILDREN = {"wikin_root_001": [NODES["wikin_child_doc1"], NODES["wikin_child_doc2"], NODES["wikin_child_doc3"]]}
 
 DOCX_BLOCKS = {
     "doxcn111": [
         {"block_id": "p0", "block_type": 1, "children": ["p1"]},
         {"block_id": "p1", "block_type": 2, "parent_id": "p0", "children": [],
          "text": {"elements": [{"text_run": {"content": "这是根目录页面正文"}}]}},
+    ],
+    # 带内嵌属性块的文档（用户知识库的真实模式）
+    "doxcn444": [
+        {"block_id": "q0", "block_type": 1,
+         "children": ["q1", "q2", "q3"]},
+        {"block_id": "q1", "block_type": 14, "parent_id": "q0",
+         "children": [],
+         "code": {"elements": [{"text_run": {"content": "---\ntype: 指南\ndepartment: 工程与交付\ntags: [组织架构, 部门总览, 岗位职责, 新人指南, 制度规范, 团队会议, 团队运营, SOP, 工具与系统入口, 术语表]\nowner: 陈蓓\nreviewer: 郑兴\nstatus: 草稿\nreview: 2026-12-31\nsummary: \"本模块介绍 Aes 工程与交付团队的整体情况，帮助团队成员（尤其是新成员）快速了解组织架构、工作方式与协作规则。\"\n---"}}],
+                 "style": {"language": "text"}}},
+        {"block_id": "q2", "block_type": 3, "parent_id": "q0", "children": [],
+         "heading1": {"elements": [{"text_run": {"content": "部门总览"}}]}},
+        {"block_id": "q3", "block_type": 2, "parent_id": "q0", "children": [],
+         "text": {"elements": [{"text_run": {"content": "正文内容"}}]}},
     ],
     "doxcn222": [
         {"block_id": "b0", "block_type": 1, "children": ["b1", "b2", "b3", "b4", "b5", "b6", "b7"]},
@@ -89,10 +107,10 @@ def fetch(method, url, headers, body):
         parent = q["parent_node_token"][0]
         items = CHILDREN.get(parent, [])
         return 200, json.dumps({"code": 0, "data": {"items": items, "has_more": False}}).encode(), {}
-    for doc_id in ("doxcn111", "doxcn222"):
+    for doc_id in ("doxcn111", "doxcn222", "doxcn444"):
         if f"/docx/v1/documents/{doc_id}" == url.split("?")[0].split("/open-apis")[1]:
             return 200, json.dumps({"code": 0, "data": {"document": {"document_id": doc_id,
-                           "revision_id": 5, "title": "子文档A" if doc_id == "doxcn222" else "根目录"}}}).encode(), {}
+                           "revision_id": 5, "title": {"doxcn222": "子文档A", "doxcn444": "组织指南"}.get(doc_id, "根目录")}}}).encode(), {}
         if f"/docx/v1/documents/{doc_id}/blocks" in url:
             return 200, json.dumps({"code": 0, "data": {"items": DOCX_BLOCKS[doc_id], "has_more": False}}).encode(), {}
     if "/sheets/v2/spreadsheets/shtcn333/metainfo" in url:
@@ -148,6 +166,26 @@ def main():
     assert "[行内代码](https://example.com)" not in md_a, "inline_code 被链接误覆盖(链接顺序bug)"
     assert "`行内代码`" in md_a, "行内代码丢失"
     assert "assets/img_tok_1.png" in md_a, "图片未重写为相对路径"
+    # 内嵌属性块合并验证
+    doc_c = out / "根目录" / "组织指南.md"
+    md_c = doc_c.read_text("utf-8")
+    print("=== 组织指南.md (属性合并) ===")
+    print(md_c[:900])
+    fm = md_c.split("---")[1]
+    assert "type: 指南" in fm, "type 未合并"
+    assert "department: 工程与交付" in fm, "department 未合并"
+    assert "owner: 陈蓓" in fm, "owner 未合并"
+    assert "reviewer: 郑兴" in fm, "reviewer 未合并"
+    assert "status: 草稿" in fm, "status 未合并"
+    assert "SOP" in fm, "tags 数组未合并"
+    assert "组织架构" in fm, "tags 数组元素丢失"
+    assert fm.index("title:") < fm.index("type:"), "title 未在业务字段之前"
+    assert "imported_at:" in fm, "imported_at 丢失"
+    # 正文中的属性代码块应被移除
+    body_c = md_c.split("---", 2)[2]
+    assert "department: 工程与交付" not in body_c, "属性代码块未从正文移除"
+    assert "# 部门总览" in body_c, "正文标题丢失"
+    assert "正文内容" in body_c, "正文内容丢失"
     print("=== 全部断言通过 ===")
     return 0
 
