@@ -503,6 +503,44 @@ class FeishuClient:
 
 
 # ---------------------------------------------------------------------------
+# 增量版本比对（v2: 树遍历阶段即判定，未变文档零内容拉取）
+# ---------------------------------------------------------------------------
+
+def node_version(node: dict, meta: Optional[dict] = None) -> str:
+    """节点的云端版本号（统一表达式，写入 state 与增量闸门共用同源值）。
+
+    优先 obj_edit_time(节点元数据自带, 列子节点时免费获得)；
+    缺失时回退 doc 元数据的 edit_time / revision_id；再缺回退 "0"。
+    """
+    v = node.get("obj_edit_time")
+    if v is None and isinstance(meta, dict):
+        v = meta.get("edit_time", meta.get("revision_id"))
+    return str(v) if v is not None else "0"
+
+
+def needs_sync(state_entry: Optional[dict], version: str,
+               local_path: Path) -> bool:
+    """判断是否需要拉取并重写该节点。
+
+    规则（云端始终为准）:
+      1. state 无记录（新文档）→ 需要
+      2. 本地文件不存在（被删/损坏）→ 需要
+      3. 云端版本号(obj_edit_time)变化 → 需要（强制覆盖）
+      4. 其余 → 跳过（零 API 内容调用）
+    """
+    if not state_entry:
+        return True
+    if not local_path.exists():
+        return True
+    return state_entry.get("edit_time") != version
+
+
+def node_content_key(node: dict) -> str:
+    """state 的主键: obj_token（同一文档在树中移动/改名仍指向同一条记录）。"""
+    return str(node.get("obj_token") or node.get("node_token", ""))
+
+
+# ---------------------------------------------------------------------------
 # docx block -> markdown
 # ---------------------------------------------------------------------------
 
@@ -848,7 +886,8 @@ class WikiSyncer:
                  space_id: str, max_depth: int = 20, max_nodes: int = 5000,
                  max_sheet_rows: int = 500, max_bitable_records: int = 500,
                  state_file: Optional[Path] = None,
-                 download_images: bool = True):
+                 download_images: bool = True,
+                 skip_tables: bool = False):
         self.client = client
         self.out = out_dir
         self.space_id = space_id
@@ -857,6 +896,7 @@ class WikiSyncer:
         self.max_sheet_rows = max_sheet_rows
         self.max_bitable_records = max_bitable_records
         self.download_images = download_images
+        self.skip_tables = skip_tables
         self.state_file = state_file or (out_dir / ".feishu_sync_state.json")
         self.state: dict = {"nodes": {}}
         self.stats = SyncStats()
@@ -937,12 +977,27 @@ class WikiSyncer:
                                      str(node.get("obj_type") or ""))
             obj_token = node.get("obj_token", "")
             title = node.get("title") or obj_token or "untitled"
+            # 目标路径先算出来，供增量闸门与 prune 共用
+            path = self.out / node_dir / (sanitize_name(title) + FILE_SUFFIX)
+            seen_paths.add(str(path.relative_to(self.out)))
             try:
+                # ---- 增量闸门（云端版本为准，提前到内容拉取之前）----
+                entry = self.state["nodes"].get(node_content_key(node))
+                if obj_type == "docx" and not needs_sync(
+                        entry, node_version(node), path):
+                    self.stats.skipped += 1
+                    continue
+                # 表格类不在闸门内（skip_tables 时直接跳过）
+                if obj_type in ("sheets", "base") and self.skip_tables:
+                    # 表格类: 跳过(对知识图谱价值低), 记录链接便于溯源
+                    LOG.debug("跳过表格节点 %s (%s)", title, obj_type)
+                    self.stats.skipped += 1
+                    continue
                 if obj_type in ("docx", "doc", "sheets", "base") or \
                         (child_count == 0 and obj_type not in ("file",)):
                     content, meta = self._render_node(obj_type, obj_token, title)
                 else:
-                    # 纯目录节点
+                    # 纯目录节点 / file 附件
                     target_dir = self.out / node_dir
                     target_dir.mkdir(parents=True, exist_ok=True)
                     self.stats.skipped += 1
@@ -962,9 +1017,7 @@ class WikiSyncer:
                     extra={"synced_at":
                            datetime.now().strftime("%Y-%m-%dT%H:%M:%S")})
                 full_md = f"{front}\n\n{cleaned_body}\n" if cleaned_body else front + "\n"
-                path = self.out / node_dir / (sanitize_name(title) + FILE_SUFFIX)
                 path.parent.mkdir(parents=True, exist_ok=True)
-                seen_paths.add(str(path.relative_to(self.out)))
                 if self._write_if_changed(path, full_md, node, meta):
                     self.stats.written += 1
                 else:
@@ -1085,23 +1138,27 @@ class WikiSyncer:
 
     def _write_if_changed(self, path: Path, content: str, node: dict,
                           meta: dict) -> bool:
-        """增量写入: edit_time 未变 + 内容一致则跳过。返回 True=已写。"""
-        token = node.get("obj_token") or node.get("node_token", "")
+        """写入节点内容并记录版本（云端为准: 已过第一道闸门的必写）。
+
+        第二道确认: 内容 sha 与 state 一致时跳过磁盘写（版本号变化但
+        内容实质相同, 如仅光标/元数据变动）, 但仍更新版本号。
+        """
+        token = node_content_key(node)
         entry = self.state["nodes"].get(token, {})
-        edit_time = node.get("obj_edit_time", 0) or meta.get("edit_time", 0)
+        edit_time = node_version(node, meta)
         sha = hashlib.sha256(content.encode("utf-8")).hexdigest()
-        if (entry.get("edit_time") == edit_time and entry.get("sha") == sha
-                and path.exists()):
-            return False
-        path.write_text(content, encoding="utf-8")
+        content_unchanged = (str(entry.get("edit_time", "")) == str(edit_time)
+                             and entry.get("sha") == sha and path.exists())
+        if not content_unchanged:
+            path.write_text(content, encoding="utf-8")
         self.state["nodes"][token] = {
             "title": node.get("title", ""),
             "path": str(path.relative_to(self.out)),
-            "edit_time": edit_time,
+            "edit_time": str(edit_time),
             "sha": sha,
             "synced_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
         }
-        return True
+        return not content_unchanged
 
 
 # ---------------------------------------------------------------------------
@@ -1123,6 +1180,8 @@ def main(argv=None):
                         help="不下载图片（.env 中 SYNC_DOWNLOAD_IMAGES=false 同效）")
     parser.add_argument("--prune", action="store_true",
                         help="删除源端已不存在的本地文件（定时清理）")
+    parser.add_argument("--skip-tables", action="store_true",
+                        help="跳过 bitable/sheet 表格类文档（图谱价值低，默认在 .env 中配置）")
     parser.add_argument("-v", "--verbose", action="store_true")
     parser.add_argument("command", choices=["list-spaces", "sync"],
                         help="list-spaces: 列出空间; sync: 同步")
@@ -1162,9 +1221,13 @@ def main(argv=None):
 
     download_images = (os.environ.get("SYNC_DOWNLOAD_IMAGES", "true")
                        .strip().lower() not in ("false", "0", "no"))
+    skip_tables = (args.skip_tables or
+                   os.environ.get("SYNC_SKIP_TABLES", "true")
+                   .strip().lower() in ("true", "1", "yes"))
     syncer = WikiSyncer(client, out, space,
                         max_depth=args.max_depth, max_nodes=args.max_nodes,
-                        download_images=download_images and not args.no_images)
+                        download_images=download_images and not args.no_images,
+                        skip_tables=skip_tables)
     stats = syncer.sync_from(root_token, prune=args.prune)
     print(f"完成: 遍历 {stats.total} 节点, 写入 {stats.written}, "
           f"跳过 {stats.skipped}, 失败 {stats.failed}, 图片 {stats.images}")
