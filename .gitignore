@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+.feishu_sync_state.json
+output/
