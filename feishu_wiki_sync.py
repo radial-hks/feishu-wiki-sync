@@ -132,7 +132,7 @@ FEISHU_IMAGE_RE = re.compile(r"!\[([^\]]*)\]\(feishu://image/([^)]+)\)")
 # ---------------------------------------------------------------------------
 
 INLINE_PROPS_FENCE_RE = re.compile(
-    r"```(?:text|yaml|yml)\s*\n(---\n.*?\n---)\s*\n```", re.DOTALL)
+    r"```[a-z0-9_-]*\s*\n(---\n.*?\n---)\s*\n```", re.DOTALL)
 
 # frontmatter 中由同步器管理、内嵌属性不得覆盖的保留键
 RESERVED_FRONTMATTER_KEYS = frozenset({
@@ -367,7 +367,7 @@ class FeishuClient:
             if page_token:
                 params["page_token"] = page_token
             data = self._request_json("GET", f"{API}/wiki/v2/spaces", params)
-            spaces.extend(data.get("items", []))
+            spaces.extend(data.get("items") or [])
             if not data.get("has_more"):
                 break
             page_token = data.get("page_token")
@@ -391,7 +391,7 @@ class FeishuClient:
                 params["page_token"] = page_token
             data = self._request_json(
                 "GET", f"{API}/wiki/v2/spaces/{space_id}/nodes", params)
-            children.extend(data.get("items", []))
+            children.extend(data.get("items") or [])
             if max_items is not None and len(children) > max_items:
                 return children[:max_items + 1]
             if not data.get("has_more"):
@@ -416,7 +416,7 @@ class FeishuClient:
                 params["page_token"] = page_token
             data = self._request_json(
                 "GET", f"{API}/docx/v1/documents/{doc_id}/blocks", params)
-            blocks.extend(data.get("items", []))
+            blocks.extend(data.get("items") or [])
             if not data.get("has_more"):
                 break
             page_token = data.get("page_token") or ""
@@ -435,7 +435,7 @@ class FeishuClient:
         rng = f"{sheet_id}!A1:{end_col}{max_rows}"
         data = self._request_json(
             "GET", f"{API}/sheets/v2/spreadsheets/{token}/values/{urllib.parse.quote(rng, safe='!?:')}")
-        return data.get("valueRange", {}).get("values", [])
+        return (data.get("valueRange") or {}).get("values") or []
 
     # -- bitable ------------------------------------------------------------
     def list_bitable_tables(self, app_token: str) -> list:
@@ -446,7 +446,7 @@ class FeishuClient:
                 params["page_token"] = page_token
             data = self._request_json(
                 "GET", f"{API}/bitable/v1/apps/{app_token}/tables", params)
-            tables.extend(data.get("items", []))
+            tables.extend(data.get("items") or [])
             if not data.get("has_more"):
                 break
             page_token = data.get("page_token")
@@ -464,7 +464,7 @@ class FeishuClient:
                 "GET",
                 f"{API}/bitable/v1/apps/{app_token}/tables/{table_id}/fields",
                 params)
-            fields.extend(data.get("items", []))
+            fields.extend(data.get("items") or [])
             if not data.get("has_more"):
                 break
             page_token = data.get("page_token")
@@ -483,7 +483,7 @@ class FeishuClient:
                 "GET",
                 f"{API}/bitable/v1/apps/{app_token}/tables/{table_id}/records",
                 params)
-            items = data.get("items", [])
+            items = data.get("items") or []
             records.extend(items)
             if len(items) > max_records - len(records):
                 records = records[:max_records]
