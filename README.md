@@ -24,17 +24,20 @@
 #    bitable:app:readonly, docs:document.media:download(或 drive:drive:readonly)
 #    并将应用添加为目标 Wiki 空间的协作者（或文档所在目录授权）
 
-# 2. 找到 space_id
-python3 feishu_wiki_sync.py list-spaces --app-id X --app-secret Y
+# 2. 配置: 复制模板并填入凭证与目标
+cp .env.example .env   # 填 FEISHU_APP_ID / FEISHU_APP_SECRET / FEISHU_SPACE / SYNC_OUT
 
-# 3. 同步整个空间
-python3 feishu_wiki_sync.py sync --app-id X --app-secret Y \
-    --space <space_id> --out ./output
+# 3. 找到 space_id（填回 .env 的 FEISHU_SPACE）
+python3 feishu_wiki_sync.py list-spaces
 
-# 4. 定时（cron 示例，每小时）
-FEISHU_APP_ID=X FEISHU_APP_SECRET=Y
-0 * * * * python3 /path/to/feishu_wiki_sync.py sync --space <id> --out ./output --prune >> sync.log 2>&1
+# 4. 同步整个空间（所有配置来自 .env）
+python3 feishu_wiki_sync.py sync
+
+# 5. 定时（cron 示例，每小时同步 + 清理）
+0 * * * * cd /path/to/feishu-wiki-sync && python3 feishu_wiki_sync.py sync --prune >> sync.log 2>&1
 ```
+
+配置优先级：命令行参数 > 已有环境变量 > `.env` 文件。`.env` 已 gitignore，不会进公开仓库。
 
 ## Frontmatter 规范（统一属性）
 

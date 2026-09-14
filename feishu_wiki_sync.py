@@ -6,19 +6,27 @@
 将 docx/sheet/bitable 文档转换为 Markdown 落盘。幂等：重复执行只重写有变化
 （obj_edit_time 变化或内容哈希变化）的文件。
 
+配置通过仓库根目录的 .env 提供（模板见 .env.example），
+凭证优先级: 命令行参数 > 已有环境变量 > .env 文件。
+
 用法:
-  # 列出自己可访问的 wiki 空间（找 space_id）
-  python3 feishu_wiki_sync.py list-spaces --app-id X --app-secret Y
+  # 首次: 复制 .env.example 为 .env，填入 FEISHU_APP_ID / FEISHU_APP_SECRET
 
-  # 全量同步一个空间
-  python3 feishu_wiki_sync.py sync --app-id X --app-secret Y \
-      --space 1234567890 --out /path/to/output
+  # 列出应用可访问的 wiki 空间（找 space_id）
+  python3 feishu_wiki_sync.py list-spaces
 
-  # 按配置文件 + 环境变量凭证同步（适合 cron）
-  FEISHU_APP_ID=X FEISHU_APP_SECRET=Y \
-  python3 feishu_wiki_sync.py sync --config sync.yaml
+  # 全量同步（space/out 等从 .env 读取）
+  python3 feishu_wiki_sync.py sync
 
-凭证优先级: 命令行参数 > 环境变量 FEISHU_APP_ID/FEISHU_APP_SECRET > 配置文件。
+  # 定时同步 + 清理（cron 推荐）
+  python3 feishu_wiki_sync.py sync --prune
+
+.env 关键项:
+  FEISHU_APP_ID / FEISHU_APP_SECRET   飞书自建应用凭证
+  FEISHU_SPACE                        目标空间 ID
+  FEISHU_ROOT                         起始节点 token（空=空间根全量）
+  SYNC_OUT                            输出目录（如 ~/wiki/raw）
+  SYNC_DOWNLOAD_IMAGES                是否下载图片（默认 true）
 """
 
 from __future__ import annotations
@@ -45,6 +53,39 @@ except ImportError:
     raise
 
 LOG = logging.getLogger("feishu_sync")
+
+
+def load_env_file(env_path: Optional[str] = None) -> None:
+    """加载 .env 到环境变量（不覆盖已存在的值）。
+
+    查找顺序: 显式路径 > 脚本同目录 .env > 当前目录 .env
+    格式: KEY=VALUE，支持 # 注释与引号值。
+    """
+    candidates = []
+    if env_path:
+        candidates.append(Path(env_path))
+    script_dir = Path(__file__).resolve().parent
+    candidates.append(script_dir / ".env")
+    candidates.append(Path.cwd() / ".env")
+    for path in candidates:
+        if not path.is_file():
+            continue
+        try:
+            text = path.read_text("utf-8")
+        except OSError:
+            continue
+        for line in text.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            key = key.strip()
+            value = value.strip().strip("'\"")
+            if key and key not in os.environ:
+                os.environ[key] = value
+        LOG.debug("已加载 env: %s", path)
+        return
+    LOG.debug("未找到 .env，跳过")
 
 # ---------------------------------------------------------------------------
 # 常量
@@ -1067,34 +1108,19 @@ class WikiSyncer:
 # CLI
 # ---------------------------------------------------------------------------
 
-def load_credentials(args) -> tuple:
-    app_id = args.app_id or os.environ.get("FEISHU_APP_ID", "")
-    app_secret = args.app_secret or os.environ.get("FEISHU_APP_SECRET", "")
-    if not app_id or not app_secret:
-        if getattr(args, "config", None):
-            try:
-                cfg = json.loads(Path(args.config).read_text("utf-8"))
-                app_id = app_id or cfg.get("app_id", "")
-                app_secret = app_secret or cfg.get("app_secret", "")
-            except (OSError, ValueError):
-                pass
-    if not app_id or not app_secret:
-        raise SystemExit("缺少凭证：设置 --app-id/--app-secret 或环境变量 "
-                         "FEISHU_APP_ID / FEISHU_APP_SECRET")
-    return app_id, app_secret
-
-
 def main(argv=None):
     parser = argparse.ArgumentParser(description="飞书 Wiki 空间同步到本地 Markdown")
-    parser.add_argument("--app-id", help="飞书应用 AppID")
-    parser.add_argument("--app-secret", help="飞书应用 AppSecret")
-    parser.add_argument("--config", help="JSON 配置文件（含 app_id/app_secret/space/out）")
-    parser.add_argument("--space", help="Wiki space_id")
-    parser.add_argument("--root", help="起始 wiki 节点 token（默认用 space 下第一个根节点）")
-    parser.add_argument("--out", help="输出目录")
+    parser.add_argument("--app-id", help="飞书应用 AppID（默认取 .env / 环境变量）")
+    parser.add_argument("--app-secret", help="飞书应用 AppSecret（默认取 .env / 环境变量）")
+    parser.add_argument("--env", help="指定 .env 文件路径（默认: 脚本同目录 .env）")
+    parser.add_argument("--space", help="Wiki space_id（默认取 .env 的 FEISHU_SPACE）")
+    parser.add_argument("--root", help="起始 wiki 节点 token（默认取 .env 的 FEISHU_ROOT，"
+                        "为空则从空间根节点全量遍历）")
+    parser.add_argument("--out", help="输出目录（默认取 .env 的 SYNC_OUT，再默认 ./feishu-wiki-out）")
     parser.add_argument("--max-depth", type=int, default=20)
     parser.add_argument("--max-nodes", type=int, default=5000)
-    parser.add_argument("--no-images", action="store_true")
+    parser.add_argument("--no-images", action="store_true",
+                        help="不下载图片（.env 中 SYNC_DOWNLOAD_IMAGES=false 同效）")
     parser.add_argument("--prune", action="store_true",
                         help="删除源端已不存在的本地文件（定时清理）")
     parser.add_argument("-v", "--verbose", action="store_true")
@@ -1106,7 +1132,14 @@ def main(argv=None):
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S")
 
-    app_id, app_secret = load_credentials(args)
+    # 配置优先级: 命令行参数 > 已有环境变量 > .env
+    load_env_file(args.env)
+
+    app_id = args.app_id or os.environ.get("FEISHU_APP_ID", "")
+    app_secret = args.app_secret or os.environ.get("FEISHU_APP_SECRET", "")
+    if not app_id or not app_secret:
+        raise SystemExit("缺少凭证：--app-id/--app-secret 或 .env 中 "
+                         "FEISHU_APP_ID / FEISHU_APP_SECRET")
     client = FeishuClient(app_id, app_secret)
 
     if args.command == "list-spaces":
@@ -1114,25 +1147,24 @@ def main(argv=None):
             print(f"{sp.get('space_id')}\t{sp.get('name')}")
         return 0
 
-    # sync
-    cfg = {}
-    if args.config:
-        try:
-            cfg = json.loads(Path(args.config).read_text("utf-8"))
-        except (OSError, ValueError) as exc:
-            raise SystemExit(f"配置文件读取失败: {exc}")
-    space = args.space or cfg.get("space", "")
-    out = Path(args.out or cfg.get("out", "./feishu-wiki-out"))
+    # sync — space/root/out 均可由 .env 提供
+    space = args.space or os.environ.get("FEISHU_SPACE", "")
+    root_token = (args.root if args.root is not None
+                  else os.environ.get("FEISHU_ROOT", ""))
+    out_raw = (args.out or os.environ.get("SYNC_OUT", "")
+               or "./feishu-wiki-out")
+    out = Path(os.path.expanduser(out_raw))
     if not space:
-        raise SystemExit("缺少 --space（可用 list-spaces 查询）")
+        raise SystemExit("缺少 --space（可用 list-spaces 查询后填入 .env 的 FEISHU_SPACE）")
 
-    root_token = args.root or cfg.get("root", "")
     if not root_token:
         LOG.info("未指定 --root，从空间 %s 的根节点开始全量遍历", space)
 
+    download_images = (os.environ.get("SYNC_DOWNLOAD_IMAGES", "true")
+                       .strip().lower() not in ("false", "0", "no"))
     syncer = WikiSyncer(client, out, space,
                         max_depth=args.max_depth, max_nodes=args.max_nodes,
-                        download_images=not args.no_images)
+                        download_images=download_images and not args.no_images)
     stats = syncer.sync_from(root_token, prune=args.prune)
     print(f"完成: 遍历 {stats.total} 节点, 写入 {stats.written}, "
           f"跳过 {stats.skipped}, 失败 {stats.failed}, 图片 {stats.images}")
