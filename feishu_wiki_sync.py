@@ -1041,9 +1041,15 @@ class WikiSyncer:
         return self.stats
 
     def _prune(self, seen_paths: Optional[set]) -> int:
-        """删除本地多余文件（源端已删除/改名），并清理空目录与失效状态。
+        """删除本地多余文件（源端已删除/改名），并清理失效状态与孤儿资源。
 
         seen_paths 为 None 时跳过清理（保守模式）。
+        顺序:
+          1) 删除不在 seen_paths 的 .md
+          2) state 中 path 失效的条目移除
+          3) 孤儿资源清理: 解析全部存活 .md 的 assets/ 引用，
+             未被任何存活文档引用的图片文件删除
+          4) 空目录回收（自底向上）
         返回删除的文件数。
         """
         if seen_paths is None:
@@ -1056,18 +1062,31 @@ class WikiSyncer:
                 LOG.info("清理(源端已删除): %s", rel)
                 fpath.unlink()
                 removed += 1
-        # 2) 状态文件中已不存在于 seen 的条目
-        valid_tokens = set()
-        for entry in self.state.get("nodes", {}).values():
-            if entry.get("path") in seen_paths:
-                valid_tokens.add(entry.get("edit_time", ""))  # 占位，下面按 token 清
-        # 直接按 path 判定重建 state
+        # 2) state 重建（按 path 保留）
         new_nodes = {}
         for token, entry in self.state.get("nodes", {}).items():
             if entry.get("path") in seen_paths:
                 new_nodes[token] = entry
         self.state["nodes"] = new_nodes
-        # 3) 清理空目录（自底向上）
+        # 3) 孤儿资源: 存活 .md 中引用的 assets 相对路径并集
+        referenced: set = set()
+        for fpath in self.out.rglob("*.md"):
+            rel_dir = fpath.parent
+            try:
+                text = fpath.read_text("utf-8", errors="replace")
+            except OSError:
+                continue
+            for m in re.finditer(r"\]\((assets/[^)\s]+)\)", text):
+                referenced.add((rel_dir / m.group(1)).resolve())
+        orphan_assets = 0
+        for apath in self.out.rglob("assets/*"):
+            if apath.is_file() and apath.resolve() not in referenced:
+                LOG.info("清理(孤儿资源): %s", apath.relative_to(self.out))
+                apath.unlink()
+                orphan_assets += 1
+        if orphan_assets:
+            LOG.info("共清理孤儿资源 %d 个", orphan_assets)
+        # 4) 空目录回收（自底向上）
         for d in sorted(self.out.rglob("*"), reverse=True):
             if d.is_dir() and d != self.out:
                 try:
