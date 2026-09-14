@@ -917,17 +917,6 @@ class WikiSyncer:
         tmp.replace(self.state_file)
 
     # -- tree -------------------------------------------------------------
-    def walk_space(self):
-        """从空间根开始遍历，yield (node, rel_dir)。
-
-        返回值 node 含: node_token, obj_type, obj_token, title, obj_edit_time
-        rel_dir 是该节点应落的相对目录。
-        """
-        # 空间根: 拿不到根节点 token，用 spaces API 无法列根；遍历策略:
-        # 官方 API 不提供“空间根节点列表”，只能从已挂载节点开始。
-        # 常见做法: 空间创建时的首个节点无法枚举 -> 我们提供 --root 参数
-        raise NotImplementedError
-
     def walk_from(self, root_token: str = ""):
         """从 wiki 节点 token 开始递归遍历；为空时从空间根节点列表开始。"""
         if root_token:
