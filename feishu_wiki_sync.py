@@ -1044,9 +1044,15 @@ class WikiSyncer:
         if seen_paths is None:
             return 0
         removed = 0
+        # 排除图谱工具产物（graphify-out: 语义缓存/图谱/报告，与飞书源无关，
+        # 由 graphify 自身的增量机制管理，不受 prune 波及）
+        excluded_prefixes = ("graphify-out",)
         # 1) 本地存在但本轮未同步到的 .md → 源端已删除/改名
         for fpath in self.out.rglob("*.md"):
             rel = str(fpath.relative_to(self.out))
+            first = rel.split("/", 1)[0] if "/" in rel else rel
+            if first in excluded_prefixes:
+                continue
             if rel not in seen_paths:
                 LOG.info("清理(源端已删除): %s", rel)
                 fpath.unlink()
@@ -1075,9 +1081,13 @@ class WikiSyncer:
                 orphan_assets += 1
         if orphan_assets:
             LOG.info("共清理孤儿资源 %d 个", orphan_assets)
-        # 4) 空目录回收（自底向上）
+        # 4) 空目录回收（自底向上；不删排除前缀内的目录）
         for d in sorted(self.out.rglob("*"), reverse=True):
             if d.is_dir() and d != self.out:
+                rel = str(d.relative_to(self.out))
+                first = rel.split("/", 1)[0] if "/" in rel else rel
+                if first in excluded_prefixes:
+                    continue
                 try:
                     next(d.iterdir())
                 except StopIteration:
